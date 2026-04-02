@@ -35,6 +35,7 @@ One lookup replaces any if/elif chain.
 
 ```python
 def safe_path(p: str) -> Path:
+    # 相对工作区解析路径，禁止 ../ 等逃逸到工作区外
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -43,14 +44,17 @@ def safe_path(p: str) -> Path:
 def run_read(path: str, limit: int = None) -> str:
     text = safe_path(path).read_text()
     lines = text.splitlines()
+    # 可选：只返回前 limit 行，避免大文件撑爆上下文
     if limit and limit < len(lines):
         lines = lines[:limit]
+    # 截断总字符数，与常见 agent 读文件上限一致
     return "\n".join(lines)[:50000]
 ```
 
 2. dispatch map 将工具名映射到处理函数。
 
 ```python
+# 工具名 -> 处理函数；LLM 的 tool_use.name 在此查找，无需改循环里的 if/elif
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -65,9 +69,11 @@ TOOL_HANDLERS = {
 ```python
 for block in response.content:
     if block.type == "tool_use":
+        # 按名称分发；未注册则返回可读错误，仍走同一套 tool_result 回传
         handler = TOOL_HANDLERS.get(block.name)
         output = handler(**block.input) if handler \
             else f"Unknown tool: {block.name}"
+        # 与 s01 相同：把结果挂回 tool_use_id，供下一轮模型消费
         results.append({
             "type": "tool_result",
             "tool_use_id": block.id,

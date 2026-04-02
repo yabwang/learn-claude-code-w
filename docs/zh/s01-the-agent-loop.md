@@ -30,12 +30,14 @@
 1. 用户 prompt 作为第一条消息。
 
 ```python
+# 首轮：把用户问题放进对话历史，后续会在同一列表上累加 assistant / tool 回合
 messages.append({"role": "user", "content": query})
 ```
 
 2. 将消息和工具定义一起发给 LLM。
 
 ```python
+# tools= 告知模型可调用的工具；返回的 content 里可能含文本块与 tool_use 块
 response = client.messages.create(
     model=MODEL, system=SYSTEM, messages=messages,
     tools=TOOLS, max_tokens=8000,
@@ -45,7 +47,9 @@ response = client.messages.create(
 3. 追加助手响应。检查 `stop_reason` -- 如果模型没有调用工具, 结束。
 
 ```python
+# 必须把助手整段输出写回历史，下一轮模型才能基于自己的上文继续推理
 messages.append({"role": "assistant", "content": response.content})
+# 未请求工具 = 模型认为可以给出最终答案，循环结束
 if response.stop_reason != "tool_use":
     return
 ```
@@ -53,6 +57,7 @@ if response.stop_reason != "tool_use":
 4. 执行每个工具调用, 收集结果, 作为 user 消息追加。回到第 2 步。
 
 ```python
+# 每个 tool_use 必须有对应的 tool_result，且 tool_use_id 与请求一一对应
 results = []
 for block in response.content:
     if block.type == "tool_use":
@@ -62,6 +67,7 @@ for block in response.content:
             "tool_use_id": block.id,
             "content": output,
         })
+# 工具输出以 user 消息形式喂回；API 约定如此，便于下一轮模型继续对话
 messages.append({"role": "user", "content": results})
 ```
 
@@ -69,6 +75,7 @@ messages.append({"role": "user", "content": results})
 
 ```python
 def agent_loop(query):
+    # 单条 user 起步；之后每轮追加 assistant，若有工具则再追加一条 user(tool_results)
     messages = [{"role": "user", "content": query}]
     while True:
         response = client.messages.create(
@@ -77,6 +84,7 @@ def agent_loop(query):
         )
         messages.append({"role": "assistant", "content": response.content})
 
+        # 无工具调用则结束；否则执行工具并把结果作为下一条 user 消息
         if response.stop_reason != "tool_use":
             return
 
