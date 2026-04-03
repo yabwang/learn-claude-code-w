@@ -36,9 +36,11 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
+# 使用自定义网关时去掉可能冲突的 Anthropic 官方鉴权变量
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
+# 工作区根：read/write/edit 相对路径均基于此，由 safe_path 防止路径逃逸
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
@@ -48,12 +50,15 @@ Use the todo tool to plan multi-step tasks. Mark in_progress before starting, co
 Prefer tools over prose."""
 
 
-# -- TodoManager: structured state the LLM writes to --
+# -- TodoManager：模型通过 todo 工具写入的结构化任务列表 --
 class TodoManager:
+    """维护 id/text/status 列表，供工具调用更新并在对话中展示进度。"""
+
     def __init__(self):
         self.items = []
 
     def update(self, items: list) -> str:
+        """校验并替换整表任务；返回 render() 后的可读文本作为 tool_result。"""
         if len(items) > 20:
             raise ValueError("Max 20 todos allowed")
         validated = []
@@ -69,12 +74,14 @@ class TodoManager:
             if status == "in_progress":
                 in_progress_count += 1
             validated.append({"id": item_id, "text": text, "status": status})
+        # 与常见「单线程」工作流一致：同时只能有一项进行中
         if in_progress_count > 1:
             raise ValueError("Only one task can be in_progress at a time")
         self.items = validated
         return self.render()
 
     def render(self) -> str:
+        """将任务列表格式化为带勾选符号的文本，供模型与用户阅读。"""
         if not self.items:
             return "No todos."
         lines = []
@@ -86,17 +93,20 @@ class TodoManager:
         return "\n".join(lines)
 
 
+# 全局单例：todo 工具每次调用都更新同一份状态
 TODO = TodoManager()
 
 
-# -- Tool implementations --
+# -- 文件/Shell 工具实现（与 s02 同源思路，供模型完成真实任务）--
 def safe_path(p: str) -> Path:
+    # 解析后必须仍在 WORKDIR 下，防止 ../ 跳出沙箱
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
 def run_bash(command: str) -> str:
+    # 教学用简单黑名单；生产需白名单或隔离执行
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -113,7 +123,7 @@ def run_read(path: str, limit: int = None) -> str:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
-        return "\n".join(lines)[:50000]
+        return "\n".join(lines)[:50000]  # 截断避免超长上下文
     except Exception as e:
         return f"Error: {e}"
 
@@ -132,12 +142,13 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         content = fp.read_text()
         if old_text not in content:
             return f"Error: Text not found in {path}"
-        fp.write_text(content.replace(old_text, new_text, 1))
+        fp.write_text(content.replace(old_text, new_text, 1))  # 仅替换首处匹配
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
 
 
+# 工具名 -> 可调用实现；Anthropic 返回的 block.input 以关键字参数传入
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -146,6 +157,7 @@ TOOL_HANDLERS = {
     "todo":       lambda **kw: TODO.update(kw["items"]),
 }
 
+# 传给 Messages API 的工具定义（JSON Schema）；名称须与 TOOL_HANDLERS 键一致
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -160,11 +172,11 @@ TOOLS = [
 ]
 
 
-# -- Agent loop with nag reminder injection --
+# -- Agent 循环：连续多轮未调用 todo 时注入「催更」用户消息 --
 def agent_loop(messages: list):
+    """单轮对话内可能多次模型调用，直到 stop_reason 非 tool_use 为止。"""
     rounds_since_todo = 0
     while True:
-        # Nag reminder is injected below, alongside tool results
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
@@ -186,6 +198,7 @@ def agent_loop(messages: list):
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
                 if block.name == "todo":
                     used_todo = True
+        # 本 assistant 轮若调用了 todo 则清零；否则累加，满 3 轮在下一轮 user 里塞提醒
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
             results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
@@ -193,6 +206,7 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+    # 整条对话历史传给 API；最后一项在 agent_loop 后应为 assistant 的最终文本块
     history = []
     while True:
         try:
@@ -204,6 +218,7 @@ if __name__ == "__main__":
         history.append({"role": "user", "content": query})
         agent_loop(history)
         response_content = history[-1]["content"]
+        # assistant 消息可能是 ContentBlock 列表，只打印其中的 text
         if isinstance(response_content, list):
             for block in response_content:
                 if hasattr(block, "text"):
